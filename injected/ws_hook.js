@@ -57,19 +57,40 @@
 				get: function() { return onmessageFunction || null; },
 				set: function(func) { onmessageFunction = wsHook.onMessage = func; }
 			});
-			// Debug logging for the "can't start a new song after a long pause" bug.
+			// Spotify's dealer only reconnects on a close it sees as an unexpected disconnect.
+			// Its onerror handler marks the socket as not connected, so an error right before
+			// the close (e.g. after the computer slept) makes it treat the close as an
+			// authentication failure and never reconnect. Once the socket has opened we
+			// therefore don't forward error events; the close that follows triggers the reconnect.
+			var onerrorFunction;
+			var wasOpened = false;
+			Object.defineProperty(WSObject, 'onerror', {
+				configurable: true,
+				get: function() { return onerrorFunction || null; },
+				set: function(func) { onerrorFunction = func; }
+			});
+
 			console.log("SpotiAds[ws]: opening " + String(url).split("?")[0] + " at " + new Date().toLocaleTimeString());
 			WSObject.addEventListener('open', function()
 			{
+				wasOpened = true;
+				wsHook.openedCount = (wsHook.openedCount || 0) + 1;
 				console.log("SpotiAds[ws]: open at " + new Date().toLocaleTimeString());
+			});
+			WSObject.addEventListener('error', function(event)
+			{
+				if (wasOpened)
+				{
+					console.warn("SpotiAds[ws]: error after open at " + new Date().toLocaleTimeString() + ", not forwarded so Spotify reconnects on close");
+					return;
+				}
+				console.warn("SpotiAds[ws]: error while connecting at " + new Date().toLocaleTimeString());
+				if (onerrorFunction) onerrorFunction.call(WSObject, event);
 			});
 			WSObject.addEventListener('close', function(event)
 			{
 				console.warn("SpotiAds[ws]: closed at " + new Date().toLocaleTimeString() + ", code " + event.code + ", reason '" + event.reason + "'");
-			});
-			WSObject.addEventListener('error', function()
-			{
-				console.warn("SpotiAds[ws]: error at " + new Date().toLocaleTimeString());
+				if (wasOpened) ensureReconnect(wsHook.openedCount);
 			});
 
 			WSObject.addEventListener('message', function(event)
@@ -100,6 +121,23 @@
 			});
 
 			return WSObject;
+		}
+
+		// Safety net: if no new socket has opened a while after a disconnect, fire a synthetic
+		// "online" event. Spotify's transport listens for it and runs its own reconnect
+		// (it ignores the event if it is already reconnecting or was disconnected on purpose).
+		var reconnectCheckDelays = [15000, 30000, 60000];
+		function ensureReconnect(openedCountAtClose, attempt = 0)
+		{
+			if (attempt >= reconnectCheckDelays.length) return;
+			setTimeout(function()
+			{
+				if (wsHook.openedCount != openedCountAtClose) return; // reconnected
+
+				console.warn("SpotiAds[ws]: still disconnected, asking Spotify to reconnect (attempt " + (attempt + 1) + ")");
+				window.dispatchEvent(new Event('online'));
+				ensureReconnect(openedCountAtClose, attempt + 1);
+			}, reconnectCheckDelays[attempt]);
 		}
 
 		// Keep WebSocket.OPEN/CLOSED/... and instanceof working for Spotify's reconnect logic.

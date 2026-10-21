@@ -141,8 +141,13 @@ async function onAccessTokenResponseIntercepted(accessTokenResponse)
 //
 // Hook the WebSocket channel.
 //
-wsHook.after = function(messageEvent, url) 
+wsHook.after = function(messageEvent, url)
 {
+    // Messages without payloads (e.g. the heartbeat "pong") are never modified. Don't queue
+    // them: if they wait behind a slow item, Spotify's 10s heartbeat times out.
+    if (typeof messageEvent.data != "string" || !messageEvent.data.includes('"payloads"'))
+        return Promise.resolve(messageEvent);
+
     var promise = async function(messageEvent) {
 
     try
