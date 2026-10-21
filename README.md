@@ -1,6 +1,6 @@
 # spotify-ad-skip
 
-A browser extension (Chrome / Edge, Manifest V3) that removes audio ads on the Spotify™ Web Player.
+A browser extension (Chrome / Edge, Manifest V3) that removes audio ads on the Spotify Web Player.
 
 This is a fork of [tomer8007/spotify-web-ads-remover](https://github.com/tomer8007/spotify-web-ads-remover) by Tomer, with fixes for the player getting stuck after a long pause.
 
@@ -36,5 +36,3 @@ No data is ever transmitted anywhere. No backend, no analytics, no server.
 ## License
 
 GNU General Public License v3.0, the same as the original project. See [LICENSE](LICENSE).
-
-Spotify is a trademark of Spotify AB. This project is not affiliated with or endorsed by Spotify.
