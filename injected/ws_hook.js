@@ -46,26 +46,47 @@
 				}).catch(function(e)
 				{
 					console.error(e);
-					_send.apply(WSObject, [newData]);  
+					_send.apply(WSObject, [data]);
 				});
 			}
 
 			// Events needs to be proxied and bubbled down.
 			var onmessageFunction;
-			WSObject.__defineSetter__('onmessage', function(func) 
-			{
-				onmessageFunction = wsHook.onMessage = func;
+			Object.defineProperty(WSObject, 'onmessage', {
+				configurable: true,
+				get: function() { return onmessageFunction || null; },
+				set: function(func) { onmessageFunction = wsHook.onMessage = func; }
 			});
-			WSObject.addEventListener('message', function(event) 
+			// Debug logging for the "can't start a new song after a long pause" bug.
+			console.log("SpotiAds[ws]: opening " + String(url).split("?")[0] + " at " + new Date().toLocaleTimeString());
+			WSObject.addEventListener('open', function()
+			{
+				console.log("SpotiAds[ws]: open at " + new Date().toLocaleTimeString());
+			});
+			WSObject.addEventListener('close', function(event)
+			{
+				console.warn("SpotiAds[ws]: closed at " + new Date().toLocaleTimeString() + ", code " + event.code + ", reason '" + event.reason + "'");
+			});
+			WSObject.addEventListener('error', function()
+			{
+				console.warn("SpotiAds[ws]: error at " + new Date().toLocaleTimeString());
+			});
+
+			WSObject.addEventListener('message', function(event)
 			{
 				if (!onmessageFunction)
 				{
 					console.log("warning: no onmessageFunction");
 					return;
 				}
-			
+
+				var receivedAt = Date.now();
 				wsHook.after(new MutableMessageEvent(event), this.url).then(function(modifiedEvent)
 				{
+					var delay = Date.now() - receivedAt;
+					if (delay > 1000)
+						console.warn("SpotiAds[ws]: message was held for " + delay + "ms before reaching Spotify");
+
 					if (modifiedEvent != null)
 						onmessageFunction.apply(this, [modifiedEvent]);
 					
@@ -80,6 +101,10 @@
 
 			return WSObject;
 		}
+
+		// Keep WebSocket.OPEN/CLOSED/... and instanceof working for Spotify's reconnect logic.
+		Object.setPrototypeOf(WebSocket, _WS);
+		WebSocket.prototype = _WS.prototype;
 	})();
 
 	// Mutable MessageEvent.

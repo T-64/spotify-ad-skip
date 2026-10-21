@@ -30,17 +30,39 @@ var statesManipuationQueue = new PromiseQueue();
 //
 window.fetch = function(url, init)
 {
+    // Never let our hook throw: a synchronous exception here breaks Spotify's own request logic.
+    try
+    {
+        return hookedFetch(url, init).then(function(response)
+        {
+            // Debug logging for the "can't start a new song after a long pause" bug.
+            if (response && response.status >= 400)
+                console.warn("SpotiAds[fetch]: " + response.status + " from " + String(url).split("?")[0] + " at " + new Date().toLocaleTimeString());
+            return response;
+        });
+    }
+    catch (exception)
+    {
+        console.error("SpotiAds: fetch hook failed, passing request through", exception);
+        return originalFetch.call(window, url, init);
+    }
+};
+
+function hookedFetch(url, init)
+{
     var url = typeof(url) == 'string' ? url : url.toString();
 
-    if (url != undefined && url.includes("/state"))
+    if (url != undefined && url.includes("/state") && init && init.body && init.headers)
     {
+        var request = JSON.parse(init.body);
+        if (request["state_ref"] == null)
+            return originalFetch.call(window, url, init);
 
         if (init.headers["authorization"])
             authorizationHeader = init.headers["authorization"];
         if (init.headers["client-token"])
             clientToken = init.headers["client-token"];
 
-        var request = JSON.parse(init.body);
         if (request["state_ref"]["state_id"].includes("future_"))
         {
             console.log("SpotiAds: Changing Spotify's states request to reflect future state machine");
@@ -67,16 +89,19 @@ window.fetch = function(url, init)
 
         return statesManipuationQueue.enqueue(promise, {url: url, init: init});
     }
-    else if (url != undefined && url.endsWith("/devices"))
+    else if (url != undefined && url.endsWith("/devices") && init && init.body)
     {
         var request = JSON.parse(init.body);
-        deviceId = request.device.device_id;
+        if (request.device && request.device.device_id)
+            deviceId = request.device.device_id;
     }
     else if (url.includes("get_access_token"))
     {
         return originalFetch.call(window, url, init).then(function(response)
         {
-            onAccessTokenResponseIntercepted(response);
+            // Read a clone: reading the original would leave Spotify a used-up body,
+            // and its token refresh (about once an hour) would fail.
+            onAccessTokenResponseIntercepted(response.clone()).catch(console.error);
             return response;
         });
     }
@@ -96,7 +121,7 @@ window.fetch = function(url, init)
     // Make the original request.
     var fetchResult = originalFetch.call(window, url, init);
     return fetchResult;
-};
+}
 
 async function onAccessTokenResponseIntercepted(accessTokenResponse)
 {
@@ -131,6 +156,7 @@ wsHook.after = function(messageEvent, url)
             var payload = data.payloads[i];
             if (payload.type == "replace_state")
             {
+                console.log("SpotiAds[ws]: replace_state received at " + new Date().toLocaleTimeString());
                 var stateMachine = payload["state_machine"];
                 var stateRef = payload["state_ref"];
                 if (stateRef != null) 
@@ -191,11 +217,17 @@ wsHook.after = function(messageEvent, url)
 
     };
 
-    return statesManipuationQueue.enqueue(promise, messageEvent);
+    // On timeout, deliver the message unmodified rather than holding it back.
+    return statesManipuationQueue.enqueue(promise, messageEvent, () => messageEvent);
 }
 
 function onStatesFetchResponseReceived(url, init, responseBody)
 {
+    // Leave error responses (expired state, expired token, 429...) untouched so
+    // Spotify can read them and recover on its own.
+    if (!responseBody.ok || responseBody.status == 204)
+        return responseBody;
+
     var requestBody = init.body;
     var request = JSON.parse(requestBody);
 
@@ -256,7 +288,8 @@ function onStatesFetchResponseReceived(url, init, responseBody)
 
         };
 
-        return statesManipuationQueue.enqueue(promise, null);
+        // On timeout, hand Spotify the original response data.
+        return statesManipuationQueue.enqueue(promise, null, () => originalJsonPromise);
 
     }.bind(this, request);
     
@@ -266,10 +299,13 @@ function onStatesFetchResponseReceived(url, init, responseBody)
 async function manipulateStateMachine(stateMachine, startingStateIndex, isReplacingState, debug_source="")
 {
     var didRequestFutureStates = false;
+    var maxPasses = 5;
+    var pass = 0;
 
     do
     {
         var removedAds = false;
+        pass++;
 
         var originalStateMachineId = stateMachine["state_machine_id"];
         var originalStateId = stateMachine["states"][startingStateIndex]["state_id"];
@@ -401,7 +437,9 @@ async function manipulateStateMachine(stateMachine, startingStateIndex, isReplac
 
                 currentStateIdNormalized = getFutureStateId(newState["state_id"]);
 
-                if (newState != null && state["state_id"] != newState["state_id"]) 
+                // Only replace with an ad-free state. Replacing an ad with another ad would
+                // make the do-while loop run (and hit the network) forever.
+                if (newState != null && state["state_id"] != newState["state_id"] && !isAd(newState, stateMachine))
                 {
                     // We succesfully found the next state after the ad.
                     // Remove ads in the casual flow
@@ -428,7 +466,7 @@ async function manipulateStateMachine(stateMachine, startingStateIndex, isReplac
         }
 
     }
-    while (removedAds);
+    while (removedAds && pass < maxPasses);
 
     stateMachine = tryToRemoveAdTracks(stateMachine);
 
@@ -820,7 +858,7 @@ function onStateMachineError(errorCode)
     {
         Swal.fire({
             title: "Queue Error",
-            html: "It appears that for some reason SpotiAds could not retrieve the next state. Please refresh, and perhaps report that back to the developer with error code: " + errorCode,
+            html: "It appears that for some reason Spotify Ad Skip could not retrieve the next state. Please refresh, and perhaps report that back to the developer with error code: " + errorCode,
             icon: "warning",
             width: 600,
             confirmButtonColor: "#DD6B55",
@@ -882,7 +920,7 @@ function checkInterception()
     {
         Swal.fire({
             title: "Oops...",
-            html: "Spotify Ads Remover has detected that interception is not fully working. Please try refreshing this page, or, if the problem presists, writing back to the developer.",
+            html: "Spotify Ad Skip has detected that interception is not fully working. Please try refreshing this page, or, if the problem presists, writing back to the developer.",
             icon: "error",
             width: 600,
             confirmButtonColor: "#DD6B55",
@@ -900,7 +938,7 @@ function showMultiDeviceWarning()
     {
         Swal.fire({
             title: "Another device is playing",
-            html: "Please note that Spotify Ads Remover can't control over other playing devices, so ads will not be removed unless audio will play from this tab.",
+            html: "Please note that Spotify Ad Skip can't control over other playing devices, so ads will not be removed unless audio will play from this tab.",
             icon: "warning",
             width: 500,
             confirmButtonColor: "#DD6B55",
