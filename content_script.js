@@ -153,5 +153,12 @@ document.addEventListener('updateCounter', function(e)
 {
 	// just forward this to the background page
     var counterValue = JSON.parse(e.detail);
-	chrome.runtime.sendMessage({ name: "updateCounter", counterValue: counterValue });
+	// After the extension is reloaded, this old content script stays on the page until it's refreshed
+	// and can no longer reach the extension ("Extension context invalidated").
+	if (!chrome.runtime || !chrome.runtime.id) return;
+	try
+	{
+		chrome.runtime.sendMessage({ name: "updateCounter", counterValue: counterValue });
+	}
+	catch (exception) {}
 });

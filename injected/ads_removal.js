@@ -19,6 +19,7 @@ var clientToken = "";
 var authorizationHeader = "";
 
 startObserving();
+watchMediaElements();
 
 document.dispatchEvent(new CustomEvent('updateCounter', {detail: 0}));
 
@@ -76,18 +77,24 @@ function hookedFetch(url, init)
             init.body = JSON.stringify(request);
         }
 
-        var promise = async function(fetchArguments) {
-
-        return originalFetch.call(window, fetchArguments.url, fetchArguments.init).then(function(response)
+        // Only queue state manipulation, not the network request. Otherwise awaiting
+        // the response transformation below would enqueue work behind itself.
+        return originalFetch.call(window, url, init).then(function(response)
         {
+            var path = url.split("?")[0].split("/").slice(-2).join("/");
+            var logPrefix = "SpotiAds[state]: " + path + " " + (request["debug_source"] || "(no debug_source, keys: " + Object.keys(request).join(",") + ")") +
+                " " + describeStateRef(request["state_ref"]) + " -> " + response.status;
+            response.clone().text().then(function(text)
+            {
+                var keys = "";
+                try { keys = Object.keys(JSON.parse(text)).join(","); } catch (e) { keys = "(not json, " + text.length + " bytes)"; }
+                console.log(logPrefix + " response keys: " + keys + " at " + new Date().toLocaleTimeString());
+            }).catch(function() {});
             // TODO: what do we do  on 429 here?
             var modifiedResponse = onStatesFetchResponseReceived(url, init, response);
             return modifiedResponse;
         });
 
-        };
-
-        return statesManipuationQueue.enqueue(promise, {url: url, init: init});
     }
     else if (url != undefined && url.endsWith("/devices") && init && init.body)
     {
@@ -161,7 +168,7 @@ wsHook.after = function(messageEvent, url)
             var payload = data.payloads[i];
             if (payload.type == "replace_state")
             {
-                console.log("SpotiAds[ws]: replace_state received at " + new Date().toLocaleTimeString());
+                console.log("SpotiAds[ws]: replace_state received, prev " + describeStateRef(payload["prev_state_ref"]) + ", new " + describeStateRef(payload["state_ref"]) + " at " + new Date().toLocaleTimeString());
                 var stateMachine = payload["state_machine"];
                 var stateRef = payload["state_ref"];
                 if (stateRef != null) 
@@ -226,25 +233,26 @@ wsHook.after = function(messageEvent, url)
     return statesManipuationQueue.enqueue(promise, messageEvent, () => messageEvent);
 }
 
-function onStatesFetchResponseReceived(url, init, responseBody)
+async function onStatesFetchResponseReceived(url, init, responseBody)
 {
     // Leave error responses (expired state, expired token, 429...) untouched so
     // Spotify can read them and recover on its own.
     if (!responseBody.ok || responseBody.status == 204)
         return responseBody;
 
-    var requestBody = init.body;
-    var request = JSON.parse(requestBody);
-
-    var originalJsonPromise = responseBody.json();
-    responseBody.json = function(request)
+    try
     {
-        var promise = async function() {
-        
-        return originalJsonPromise.then(async function(data)
+        var request = JSON.parse(init.body);
+        // Other fetch hooks (including AdBlock's replace-fetch-response) read
+        // clone().text() and may rebuild the Response. Consuming the original
+        // and overriding only json() breaks that chain, so Spotify loses updates.
+        var originalData = await responseBody.clone().json();
+        var promise = async function()
         {
-            var stateMachine = data["state_machine"];           
-            var updatedStateRef = data["updated_state_ref"];    
+            // Timed-out work may keep running. Keep the fallback data untouched.
+            var data = structuredClone(originalData);
+            var stateMachine = data["state_machine"];
+            var updatedStateRef = data["updated_state_ref"];
 
             var commands = data["commands"];
             if (commands == null)
@@ -256,9 +264,9 @@ function onStatesFetchResponseReceived(url, init, responseBody)
 
                 var currentStateIndex = updatedStateRef["state_index"];
                 var debug_source = request["debug_source"];
-    
+
                 data["state_machine"] = await manipulateStateMachine(stateMachine, currentStateIndex, false, debug_source);
-    
+
                 isFetchInterceptionWorking = true;
             }
             else
@@ -269,36 +277,45 @@ function onStatesFetchResponseReceived(url, init, responseBody)
                 console.log("SpotiAds: We see /state_conflict");
                 for (var key of Object.keys(commands))
                 {
-                    var stateMachine = data["commands"][key]["state_machine"];           
+                    if (!commands[key] || !commands[key]["state_machine"] || !commands[key]["state_ref"])
+                        continue;
+                    var stateMachine = data["commands"][key]["state_machine"];
                     var currentStateIndex = data["commands"][key]["state_ref"]["state_index"];
 
-                    
+
                     // TODO: it's possible that data["commands"][key]["prev_state_ref"] will be different that the current state machine, states will be rejected,
                     //       which will cause Spotify to request /state_conflict. see _rejectState(). Is it our fault?
 
                     data["commands"][key]["state_machine"] = await manipulateStateMachine(stateMachine, currentStateIndex, false, "state_conflict_replace_state_command");
-        
+
                     isFetchInterceptionWorking = true;
 
                 }
             }
-            
+
             return data;
 
-        }).catch(function(reason)
-        {
-            console.error(reason);
-            return originalJsonPromise;
-        });
-
         };
-
-        // On timeout, hand Spotify the original response data.
-        return statesManipuationQueue.enqueue(promise, null, () => originalJsonPromise);
-
-    }.bind(this, request);
-    
-    return responseBody;
+        var data = await statesManipuationQueue.enqueue(promise, null, () => originalData);
+        var headers = new Headers(responseBody.headers);
+        headers.delete("content-length");
+        headers.delete("content-encoding");
+        var response = new Response(JSON.stringify(data), {
+            status: responseBody.status,
+            statusText: responseBody.statusText,
+            headers: headers
+        });
+        // Keep metadata used by the request layer, while leaving all native body
+        // readers and clone() working on the same transformed bytes.
+        for (var property of ["url", "redirected", "type"])
+            Object.defineProperty(response, property, {value: responseBody[property]});
+        return response;
+    }
+    catch (reason)
+    {
+        console.error("SpotiAds: state response transformation failed, passing through", reason);
+        return responseBody;
+    }
 }
 
 async function manipulateStateMachine(stateMachine, startingStateIndex, isReplacingState, debug_source="")
@@ -953,6 +970,52 @@ function showMultiDeviceWarning()
 
         didShowMultiDeviceWarning = true;
     }
+}
+
+function describeStateRef(stateRef)
+{
+    if (stateRef == null) return "none";
+    return String(stateRef["state_machine_id"]).slice(0, 8) + "/" + String(stateRef["state_id"]).slice(0, 8) +
+        (stateRef["state_index"] != null ? "#" + stateRef["state_index"] : "") + (stateRef["paused"] ? " paused" : "");
+}
+
+// Debug logging for the "playback stops after a song ends" bug.
+// Spotify's audio element is usually not attached to the DOM, so we catch it when play() is called.
+function watchMediaElements()
+{
+    var watched = window.spotiAdsMedia = new Set();
+    var events = ["play", "playing", "pause", "ended", "waiting", "stalled", "emptied", "error", "abort", "loadstart", "durationchange"];
+
+    function describe(media)
+    {
+        return (media.tagName || "media").toLowerCase() + " t=" + media.currentTime.toFixed(1) + "/" + (media.duration || 0).toFixed(1) +
+            " paused=" + media.paused + " muted=" + media.muted + " ready=" + media.readyState + " net=" + media.networkState +
+            (media.error ? " error=" + media.error.code : "") + " inDOM=" + media.isConnected;
+    }
+
+    function watch(media)
+    {
+        if (watched.has(media)) return;
+        watched.add(media);
+        events.forEach(function(type)
+        {
+            media.addEventListener(type, function()
+            {
+                // Skip muted looping clips (Spotify's Canvas background videos), they're noise.
+                if (media.muted && media.loop) return;
+                console.log("SpotiAds[media]: " + type + " " + describe(media) + " at " + new Date().toLocaleTimeString());
+            });
+        });
+        console.log("SpotiAds[media]: watching new " + describe(media));
+    }
+
+    var originalPlay = HTMLMediaElement.prototype.play;
+    HTMLMediaElement.prototype.play = function()
+    {
+        try { watch(this); } catch (e) { console.error(e); }
+        return originalPlay.apply(this, arguments);
+    };
+    document.querySelectorAll("audio,video").forEach(watch);
 }
 
 function startObserving()
